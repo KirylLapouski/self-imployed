@@ -73,6 +73,17 @@ const money = (n) => Math.round(n).toLocaleString('ru-RU').replace(/,/g, ' ');
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 const stripTags = (s) => String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
+const ageDays = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return Math.max(0, Math.round((Date.now() - d.getTime()) / 86400000));
+};
+const fmtDate = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleDateString('ru-RU');
+};
+
 function textHas(text, words) {
   const t = String(text || '').toLowerCase();
   return words.some((w) => t.includes(w));
@@ -92,6 +103,37 @@ function cleanAddress(raw, cityLabel) {
   return a || cityLabel;
 }
 
+function areaFromText(text) {
+  const m = String(text || '').match(/(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м2|м²|м\.\s*кв)/i);
+  if (!m) return null;
+  const v = Number(m[1].replace(',', '.'));
+  return v >= 10 && v <= 200 ? v : null;
+}
+
+function featuresFromText(text) {
+  const t = String(text || '').toLowerCase();
+  const out = [];
+  if (/яма|смотров/.test(t)) out.push('Смотровая яма');
+  if (/подвал|погреб/.test(t)) out.push('Подвал');
+  if (/электричеств|свет|220/.test(t)) out.push('Электричество 220В');
+  if (/видеонаблюден/.test(t)) out.push('Видеонаблюдение');
+  else if (/охрана|сторож|шлагбаум/.test(t)) out.push('Охрана');
+  if (/кирпич/.test(t)) out.push('Кирпич');
+  if (/ж\/б|железобетон|плит[аы] перекрытия/.test(t)) out.push('Ж/б перекрытия');
+  if (/сухой|вентиляц/.test(t)) out.push('Сухой, вентиляция');
+  if (/отоплен|печк|котел/.test(t)) out.push('Отопление');
+  if (/утепл/.test(t)) out.push('Утеплён');
+  return out;
+}
+
+function mergeFeatures(list, text) {
+  const merged = [...(list || [])];
+  for (const f of featuresFromText(text)) {
+    if (!merged.some((m) => m.toLowerCase().includes(f.toLowerCase().split(' ')[0]))) merged.push(f);
+  }
+  return merged;
+}
+
 function cooperativeFromText(text) {
   const m = String(text || '').match(/(ГПК|ГСК|ГСП|ГСПК)[-\s№]*\s*[«"]?([\wА-Яа-яЁё-]+)[»"]?/i);
   return m ? `${m[1].toUpperCase()} ${m[2]}` : null;
@@ -102,22 +144,28 @@ function kufarAdToItem(ad) {
   const params = Object.fromEntries((ad.ad_parameters || []).map((p) => [p.p, p]));
   const acc = Object.fromEntries((ad.account_parameters || []).map((p) => [p.p, p]));
   const price = ad.price_byn != null ? ad.price_byn / 100 : null;
-  const area = params.size ? Number(params.size.v) : null;
   const dist = params.distance_to_center_km ? Number(params.distance_to_center_km.v) : null;
   const improvements = params.garage_improvements?.vl;
   const features = Array.isArray(improvements) ? improvements : improvements ? [improvements] : [];
   const text = stripTags([ad.body_short, ad.body, ad.subject].filter(Boolean).join(' '));
+  const areaParam = params.size ? Number(params.size.v) : null;
+  const area = areaParam || areaFromText(text);
+  const areaEstimated = !areaParam && !!area;
+  const address = cleanAddress(acc.address?.v || acc.region?.v || config.cityLabel, config.cityLabel);
+  const loc = Number.isFinite(dist) ? { km: dist, approx: false } : estimateDistance(address, config.centerStreets, config.centerDistricts);
 
   return {
     source: 'Kufar',
     id: String(ad.ad_id),
     url: ad.ad_link,
-    address: cleanAddress(acc.address?.v || acc.region?.v || config.cityLabel, config.cityLabel),
+    address,
     type: params.garage_type?.vl || 'Гараж',
     price,
     area,
-    distanceKm: Number.isFinite(dist) ? dist : null,
-    features,
+    areaEstimated,
+    distanceKm: loc.km,
+    distanceApprox: loc.approx,
+    features: mergeFeatures(features, text),
     text,
     images: Array.isArray(ad.images) ? ad.images.length : 0,
     createdAt: ad.list_time || null,
@@ -164,18 +212,23 @@ async function collectKufarRentBenchmark() {
 }
 
 // ---------- Realt ----------
-function estimateDistance(address, centers) {
+function estimateDistance(address, centers, districts = {}) {
   const a = String(address || '').toLowerCase();
   for (const [street, km] of Object.entries(centers)) {
-    if (a.includes(street)) return km;
+    if (a.includes(street)) return { km, approx: false };
   }
-  return null;
+  for (const [district, km] of Object.entries(districts)) {
+    if (a.includes(district)) return { km, approx: true };
+  }
+  return { km: null, approx: false };
 }
 
 function realtToItem(o, centers) {
   const byn = o.priceRates?.['933'] ?? (o.priceCurrency === 933 ? o.price : null);
-  const area = o.areaTotal || o.areaMin || null;
   const text = stripTags([o.headline, o.title, o.description].filter(Boolean).join(' '));
+  const areaParam = o.areaTotal || o.areaMin || o.areaMax || null;
+  const area = areaParam || areaFromText(text);
+  const areaEstimated = !areaParam && !!Number(area);
 
   let addressRaw;
   if (o.streetName) {
@@ -186,6 +239,8 @@ function realtToItem(o, centers) {
     addressRaw = cooperativeFromText(text) || o.address || o.townName || config.cityLabel;
   }
 
+  const loc = estimateDistance(`${addressRaw} ${text}`, centers, config.centerDistricts);
+
   return {
     source: 'Realt',
     id: String(o.code || o.uuid),
@@ -194,8 +249,10 @@ function realtToItem(o, centers) {
     type: 'Гараж',
     price: byn ? Number(byn) : null,
     area: area ? Number(area) : null,
-    distanceKm: estimateDistance(addressRaw, centers),
-    features: [],
+    areaEstimated,
+    distanceKm: loc.km,
+    distanceApprox: loc.approx,
+    features: mergeFeatures([], text),
     text,
     images: Array.isArray(o.images) ? o.images.length : 0,
     createdAt: o.createdAt || null,
@@ -379,6 +436,12 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push(`**Бюджет:** ${money(MIN_PRICE)}–${money(MAX_PRICE)} BYN · **Площадь:** ${config.area.min}–${config.area.max} м² · **До центра:** ≤ ${config.maxDistanceKm} км`);
   lines.push(`**Цель:** 1 гараж в центре под сдачу физлицу (фиксированный подоходный налог ${config.taxPerMonthByn} BYN/мес.).`);
   lines.push(`**Прошло фильтры:** ${items.length} из ${scanned.total}. В шорт-лист: ${top.length}.`);
+
+  const stale = top.filter((it) => (ageDays(it.createdAt) ?? 0) > 180);
+  if (stale.length) {
+    lines.push('');
+    lines.push('> ⚠️ **Требуют проверки актуальности:** ' + stale.map((it) => `${it.address} — от ${fmtDate(it.createdAt)} (${ageDays(it.createdAt)} дн.)`).join('; ') + '. Объявления давно не обновлялись: возможна продажа или изменение цены.');
+  }
   lines.push('');
   lines.push(`## Топ-${top.length}`);
   lines.push('');
@@ -386,16 +449,20 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push('|---|---|---|---|---|---|---|---|---|');
   top.forEach((it, i) => {
     lines.push(
-      `| ${i + 1} | ${money(it.price)} | ${money(it.price / it.area)} | ${it.area} м² | ${it.address} | ${it.distanceKm != null ? it.distanceKm + ' км' : 'н/д'} | **${it.total}/100** | ~${it.rent} | ~${it.yieldPct}% |`
+      `| ${i + 1} | ${money(it.price)} | ${money(it.price / it.area)} | ${it.area} м² | ${it.address} | ${it.distanceKm != null ? (it.distanceApprox ? '≈' : '') + it.distanceKm + ' км' : 'н/д'} | **${it.total}/100** | ~${it.rent} | ~${it.yieldPct}% |`
     );
   });
   lines.push('');
 
   top.forEach((it, i) => {
+    const age = ageDays(it.createdAt);
     lines.push(`### ${i + 1}. ${it.address} — ${money(it.price)} BYN — ${it.total}/100`);
     lines.push('');
-    lines.push(`- **Площадь:** ${it.area} м² · **Цена за м²:** ${money(it.price / it.area)} BYN`);
-    lines.push(`- **Тип:** ${it.type} · **До центра:** ${it.distanceKm != null ? it.distanceKm + ' км' : 'не определено'}`);
+    lines.push(`- **Площадь:** ${it.area} м²${it.areaEstimated ? ' (по тексту объявления)' : ''} · **Цена за м²:** ${money(it.price / it.area)} BYN`);
+    lines.push(`- **Тип:** ${it.type} · **До центра:** ${it.distanceKm != null ? (it.distanceApprox ? '≈' : '') + it.distanceKm + ' км' : 'не определено'}`);
+    if (age != null) {
+      lines.push(`- **Опубликовано:** ${fmtDate(it.createdAt)} (${age} дн. назад)${age > 180 ? ' — объявление давно не обновлялось, цену и актуальность нужно уточнять' : ''}`);
+    }
     lines.push(`- **Фичи:** ${it.features.length ? it.features.join(', ') : '—'}`);
     lines.push(`- **Оценка аренды:** ~${it.rent} BYN/мес. (бенчмарк: ${bench.sample} объявл., медиана ${bench.medianRent ? money(bench.medianRent) : 'н/д'} BYN)`);
     lines.push(`- **Оценка доходности:** ~${it.yieldPct}% годовых (после налога, взносов и резерва)`);
@@ -433,6 +500,7 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push(`Оценка 0–100 = взвешенная сумма пяти критериев: юр. чистота ${config.weights.legal}%, локация ${config.weights.location}%, техсостояние ${config.weights.tech}%, цена ${config.weights.value}%, ликвидность ${config.weights.liquidity}%.`);
   lines.push('Юр. чистота и техсостояние оцениваются **только по тексту объявления** (ключевые слова: «приватизирован», «техпаспорт», «без долгов», «яма», «подвал», «свет» и т.п.) — это прокси, а не проверка документов.');
   lines.push(`Аренда оценивается по текущей медианной ставке ${bench.medianPpm ? round(bench.medianPpm, 1) + ' BYN/м²' : '8,5 BYN/м²'} с поправкой на фичи. Доходность = (аренда×12 − налог ${config.taxPerMonthByn}×12 − взносы ГСК ${config.hoaPerMonthByn}×12 − резерв ${Math.round(config.reserveShare * 100)}%) / цена.`);
+  lines.push('Расстояние до центра берётся из параметров Kufar; если его нет — оценка по названию улицы, а при отсутствии улицы по району (такие значения помечены «≈»).');
   lines.push('');
   lines.push('## Ограничения');
   lines.push('');
@@ -504,7 +572,10 @@ function explain(it) {
   const bits = [];
   if (it.criteria.legal >= 3.5) bits.push('документы/приватизация заявлены в описании');
   if (it.criteria.location >= 4) bits.push('близко к центру');
-  if (it.criteria.tech >= 3.5) bits.push('есть яма/подвал/свет/охрана');
+  if (it.criteria.tech >= 3.5) {
+    const f = it.features.slice(0, 3).join(', ');
+    bits.push(f ? `оснащение: ${f.toLowerCase()}` : 'техсостояние выше среднего по описанию');
+  }
   if (it.criteria.value >= 4) bits.push('цена ниже или около рынка');
   if (it.criteria.liquidity >= 4) bits.push('типовой ликвидный размер');
   return bits.join('; ') || 'сбалансирован по критериям';
