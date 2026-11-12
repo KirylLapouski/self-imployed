@@ -35,6 +35,7 @@ const TOP = Number(arg('top', config.top));
 const MAX_PRICE = Number(arg('max-price', config.budget.max));
 const MIN_PRICE = Number(arg('min-price', config.budget.min));
 const WITH_REALT = !args.includes('--no-realt');
+const GK = arg('gk', null);
 
 // ---------- Utils ----------
 async function fetchText(url, { retries = 2 } = {}) {
@@ -394,6 +395,7 @@ function applyFilters(items) {
   const out = [];
 
   for (const item of items) {
+    if (GK && !`${item.address} ${item.text}`.toLowerCase().includes(GK.toLowerCase())) { rej(`не ГК «${GK}»`); continue; }
     if (!item.price) { rej('нет цены'); continue; }
     if (!item.area) { rej('нет площади'); continue; }
     if (item.price < MIN_PRICE || item.price > MAX_PRICE) { rej('вне бюджета'); continue; }
@@ -436,6 +438,7 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push(`**Бюджет:** ${money(MIN_PRICE)}–${money(MAX_PRICE)} BYN · **Площадь:** ${config.area.min}–${config.area.max} м² · **До центра:** ≤ ${config.maxDistanceKm} км`);
   lines.push(`**Цель:** 1 гараж в центре под сдачу физлицу (фиксированный подоходный налог ${config.taxPerMonthByn} BYN/мес.).`);
   lines.push(`**Прошло фильтры:** ${items.length} из ${scanned.total}. В шорт-лист: ${top.length}.`);
+  if (GK) lines.push(`**Фильтр по ГК:** «${GK}» (только объявления, где кооператив указан в тексте или адресе).`);
 
   const stale = top.filter((it) => (ageDays(it.createdAt) ?? 0) > 180);
   if (stale.length) {
