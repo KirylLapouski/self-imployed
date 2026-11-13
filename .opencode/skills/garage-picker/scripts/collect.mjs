@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
  * Garage Picker — собирает объявления о продаже гаражей в Витебске,
  * фильтрует по бюджету/площади/локации, оценивает по методике doc.md
@@ -36,6 +36,8 @@ const MAX_PRICE = Number(arg('max-price', config.budget.max));
 const MIN_PRICE = Number(arg('min-price', config.budget.min));
 const WITH_REALT = !args.includes('--no-realt');
 const GK = arg('gk', null);
+const NEAR = arg('near', null);
+const MAX_MIN = Number(arg('max-min', 30));
 
 // ---------- Utils ----------
 async function fetchText(url, { retries = 2 } = {}) {
@@ -88,6 +90,36 @@ const fmtDate = (iso) => {
 function textHas(text, words) {
   const t = String(text || '').toLowerCase();
   return words.some((w) => t.includes(w));
+}
+
+function haversineKm(a, b) {
+  const R = 6371;
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lon - a.lon);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// оценка времени в пути по городу: коэффициент кривизны улиц + средняя скорость с остановками
+const driveMin = (km) => Math.max(1, Math.round((km * 1.35 * 60) / 28 + 2));
+
+async function geocodeOrigin(query, cityLabel) {
+  const tries = [
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(`${query}, ${cityLabel}, Беларусь`)}`,
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&city=${encodeURIComponent(cityLabel)}&country=Belarus&street=${encodeURIComponent(query)}`,
+  ];
+  for (const url of tries) {
+    try {
+      const res = await fetch(url, { headers: { 'user-agent': 'garage-picker/1.0 (local script)' }, signal: AbortSignal.timeout(15000) });
+      const rows = await res.json();
+      if (Array.isArray(rows) && rows[0]) return { lat: Number(rows[0].lat), lon: Number(rows[0].lon), label: rows[0].display_name };
+    } catch {
+      // пробуем следующий вариант
+    }
+    await sleep(400);
+  }
+  return null;
 }
 
 function cleanAddress(raw, cityLabel) {
@@ -154,6 +186,7 @@ function kufarAdToItem(ad) {
   const areaEstimated = !areaParam && !!area;
   const address = cleanAddress(acc.address?.v || acc.region?.v || config.cityLabel, config.cityLabel);
   const loc = Number.isFinite(dist) ? { km: dist, approx: false } : estimateDistance(address, config.centerStreets, config.centerDistricts);
+  const c = params.coordinates?.v;
 
   return {
     source: 'Kufar',
@@ -166,6 +199,8 @@ function kufarAdToItem(ad) {
     areaEstimated,
     distanceKm: loc.km,
     distanceApprox: loc.approx,
+    lat: Array.isArray(c) ? Number(c[1]) : null,
+    lon: Array.isArray(c) ? Number(c[0]) : null,
     features: mergeFeatures(features, text),
     text,
     images: Array.isArray(ad.images) ? ad.images.length : 0,
@@ -241,6 +276,7 @@ function realtToItem(o, centers) {
   }
 
   const loc = estimateDistance(`${addressRaw} ${text}`, centers, config.centerDistricts);
+  const c = Array.isArray(o.location) ? o.location : null;
 
   return {
     source: 'Realt',
@@ -253,6 +289,8 @@ function realtToItem(o, centers) {
     areaEstimated,
     distanceKm: loc.km,
     distanceApprox: loc.approx,
+    lat: c ? Number(c[1]) : null,
+    lon: c ? Number(c[0]) : null,
     features: mergeFeatures([], text),
     text,
     images: Array.isArray(o.images) ? o.images.length : 0,
@@ -388,7 +426,7 @@ function estimateYield(item, rent) {
 }
 
 // ---------- Filtering ----------
-function applyFilters(items) {
+function applyFilters(items, { origin = null } = {}) {
   const rejects = {};
   const rej = (reason) => (rejects[reason] = (rejects[reason] || 0) + 1);
   const seen = new Map();
@@ -402,7 +440,16 @@ function applyFilters(items) {
     if (item.area < config.area.min || item.area > config.area.max) { rej('неподходящая площадь'); continue; }
     const t = item.text.toLowerCase();
     if (textHas(t, config.negativeKeywords)) { rej('стоп-слово в описании'); continue; }
-    if (item.distanceKm != null && item.distanceKm > config.maxDistanceKm) { rej('далеко от центра'); continue; }
+
+    if (origin) {
+      if (item.lat == null || item.lon == null) { rej('нет координат для расчёта маршрута'); continue; }
+      item.nearKm = round(haversineKm(origin, { lat: item.lat, lon: item.lon }), 1);
+      item.nearMin = driveMin(item.nearKm);
+      if (item.nearMin > MAX_MIN) { rej(`дольше ${MAX_MIN} мин от точки старта`); continue; }
+    } else if (item.distanceKm != null && item.distanceKm > config.maxDistanceKm) {
+      rej('далеко от центра');
+      continue;
+    }
 
     // дедупликация Kufar/Realt по улице и цене (±3%)
     const street = (item.address.toLowerCase().match(/[а-яё]+(?=\s*(ул|просп|пер|б-р|тракт))/)?.[0]) || item.address.toLowerCase().slice(0, 12);
@@ -423,7 +470,7 @@ function applyFilters(items) {
 }
 
 // ---------- Report ----------
-function buildReport({ items, ranked, bench, rejects, scanned }) {
+function buildReport({ items, ranked, bench, rejects, scanned, origin, nearLabel }) {
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timeStr = now.toLocaleString('ru-RU', { hour12: false });
@@ -435,10 +482,13 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push('');
   lines.push(`**Дата отчёта:** ${timeStr}`);
   lines.push(`**Источники:** Kufar — ${scanned.kufar} объявл., Realt — ${scanned.realt} объявл.`);
-  lines.push(`**Бюджет:** ${money(MIN_PRICE)}–${money(MAX_PRICE)} BYN · **Площадь:** ${config.area.min}–${config.area.max} м² · **До центра:** ≤ ${config.maxDistanceKm} км`);
+  lines.push(`**Бюджет:** ${money(MIN_PRICE)}–${money(MAX_PRICE)} BYN · **Площадь:** ${config.area.min}–${config.area.max} м²`);
+  if (origin) lines.push(`**Радиус:** ≤ ${MAX_MIN} мин на машине от точки старта (${nearLabel}).`);
+  else lines.push(`**До центра:** ≤ ${config.maxDistanceKm} км.`);
   lines.push(`**Цель:** 1 гараж в центре под сдачу физлицу (фиксированный подоходный налог ${config.taxPerMonthByn} BYN/мес.).`);
   lines.push(`**Прошло фильтры:** ${items.length} из ${scanned.total}. В шорт-лист: ${top.length}.`);
   if (GK) lines.push(`**Фильтр по ГК:** «${GK}» (только объявления, где кооператив указан в тексте или адресе).`);
+  if (!origin) lines.push(`**Отбор по локации:** расстояние до центра города.`);
 
   const stale = top.filter((it) => (ageDays(it.createdAt) ?? 0) > 180);
   if (stale.length) {
@@ -448,13 +498,23 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   lines.push('');
   lines.push(`## Топ-${top.length}`);
   lines.push('');
-  lines.push('| # | Цена, BYN | BYN/м² | Площадь | Адрес | До центра | Оценка | Аренда, BYN/мес. | Доходность |');
-  lines.push('|---|---|---|---|---|---|---|---|---|');
-  top.forEach((it, i) => {
-    lines.push(
-      `| ${i + 1} | ${money(it.price)} | ${money(it.price / it.area)} | ${it.area} м² | ${it.address} | ${it.distanceKm != null ? (it.distanceApprox ? '≈' : '') + it.distanceKm + ' км' : 'н/д'} | **${it.total}/100** | ~${it.rent} | ~${it.yieldPct}% |`
-    );
-  });
+  if (origin) {
+    lines.push('| # | Цена, BYN | BYN/м² | Площадь | Адрес | До старта | Оценка | Аренда, BYN/мес. | Доходность |');
+    lines.push('|---|---|---|---|---|---|---|---|---|');
+    top.forEach((it, i) => {
+      lines.push(
+        `| ${i + 1} | ${money(it.price)} | ${money(it.price / it.area)} | ${it.area} м² | ${it.address} | ${it.nearKm} км / ~${it.nearMin} мин | **${it.total}/100** | ~${it.rent} | ~${it.yieldPct}% |`
+      );
+    });
+  } else {
+    lines.push('| # | Цена, BYN | BYN/м² | Площадь | Адрес | До центра | Оценка | Аренда, BYN/мес. | Доходность |');
+    lines.push('|---|---|---|---|---|---|---|---|---|');
+    top.forEach((it, i) => {
+      lines.push(
+        `| ${i + 1} | ${money(it.price)} | ${money(it.price / it.area)} | ${it.area} м² | ${it.address} | ${it.distanceKm != null ? (it.distanceApprox ? '≈' : '') + it.distanceKm + ' км' : 'н/д'} | **${it.total}/100** | ~${it.rent} | ~${it.yieldPct}% |`
+      );
+    });
+  }
   lines.push('');
 
   top.forEach((it, i) => {
@@ -463,6 +523,7 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
     lines.push('');
     lines.push(`- **Площадь:** ${it.area} м²${it.areaEstimated ? ' (по тексту объявления)' : ''} · **Цена за м²:** ${money(it.price / it.area)} BYN`);
     lines.push(`- **Тип:** ${it.type} · **До центра:** ${it.distanceKm != null ? (it.distanceApprox ? '≈' : '') + it.distanceKm + ' км' : 'не определено'}`);
+    if (origin) lines.push(`- **До точки старта (${nearLabel}):** ${it.nearKm} км, ~${it.nearMin} мин на машине`);
     if (age != null) {
       lines.push(`- **Опубликовано:** ${fmtDate(it.createdAt)} (${age} дн. назад)${age > 180 ? ' — объявление давно не обновлялось, цену и актуальность нужно уточнять' : ''}`);
     }
@@ -476,6 +537,11 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
     lines.push(`- **Источник:** ${it.source}, ID ${it.id}`);
     lines.push('');
   });
+
+  if (origin && top.length > 1) {
+    lines.push(buildRouteSection(ranked.slice(0, 12), origin, nearLabel));
+    lines.push('');
+  }
 
   if (next.length) {
     lines.push('## Следующие кандидаты');
@@ -516,10 +582,76 @@ function buildReport({ items, ranked, bench, rejects, scanned }) {
   return { dateStr, markdown: lines.join('\n') };
 }
 
+// ---------- Route ----------
+function buildRouteSection(top, origin, nearLabel) {
+  const agePenalty = (it) => ((ageDays(it.createdAt) ?? 0) > 120 ? 12 : 0);
+  const orderFrom = (start, cluster) => {
+    const left = [...cluster];
+    const seq = [];
+    let prev = start;
+    while (left.length) {
+      left.sort((a, b) => haversineKm(prev, a) - haversineKm(prev, b));
+      const nextItem = left.shift();
+      seq.push(nextItem);
+      prev = nextItem;
+    }
+    return seq;
+  };
+
+  let best = null;
+  for (const anchor of top) {
+    const close = top
+      .filter((it) => it !== anchor && haversineKm(anchor, it) <= 2.5)
+      .sort((a, b) => b.total - a.total || haversineKm(anchor, a) - haversineKm(anchor, b));
+    const cluster = [anchor, ...close.slice(0, 2)];
+    const route = orderFrom(origin, cluster);
+    const driveTotal = route.reduce((acc, it, i) => acc + driveMin(haversineKm(i ? route[i - 1] : origin, it)), 0);
+    const value = cluster.reduce((acc, it) => acc + it.total - agePenalty(it), 0) - driveTotal * 0.5 - (3 - cluster.length) * 8;
+    if (!best || value > best.value) best = { value, route, driveTotal };
+  }
+  if (!best) return '';
+  const { route, driveTotal } = best;
+
+  const legs = [];
+  let prev = origin;
+  for (const it of route) {
+    const km = haversineKm(prev, it);
+    legs.push({ it, km: round(km, 1), min: driveMin(km) });
+    prev = it;
+  }
+  const viewMinutes = route.length * 10;
+  const lines = [];
+  lines.push('## Маршрут на день');
+  lines.push('');
+  lines.push(`Связка из ${route.length} объектов: суммарно ~${driveTotal} мин в пути и ~${viewMinutes} мин на осмотры (${driveTotal + viewMinutes} мин чистыми, без пробок). Все объекты в радиусе ~2,5 км друг от друга, так что можно посмотреть за один выезд.`);
+  lines.push('');
+  lines.push('| Порядок | Адрес | Цена | Оценка | От предыдущей точки | Ссылка |');
+  lines.push('|---|---|---|---|---|---|');
+  legs.forEach((l, i) => {
+    lines.push(`| ${i + 1} | ${l.it.address} | ${money(l.it.price)} BYN | ${l.it.total}/100 | ${l.km} км / ~${l.min} мин | ${l.it.url} |`);
+  });
+  lines.push('');
+  lines.push('> Перед выездом позвоните и подтвердите, что объект ещё в продаже и сегодня можно посмотреть. Порядок лучше уточнить по телефону: часть продавцов бывает на месте только вечером.');
+  return lines.join('\n');
+}
+
 // ---------- Main ----------
 async function main() {
   const scanned = { kufar: 0, realt: 0, total: 0 };
   const items = [];
+
+  let origin = null;
+  let nearLabel = NEAR;
+  if (NEAR) {
+    const geo = await geocodeOrigin(NEAR, config.cityLabel);
+    if (!geo) {
+      console.error(`Не удалось определить координаты точки «${NEAR}». Укажите ориентир иначе или запустите без --near.`);
+      process.exit(1);
+    }
+    origin = { lat: geo.lat, lon: geo.lon };
+    nearLabel = NEAR;
+    console.log(`Точка старта: ${NEAR} → ${geo.lat.toFixed(5)}, ${geo.lon.toFixed(5)} (${geo.label.split(',')[0]})`);
+  }
 
   const results = await Promise.allSettled([
     collectKufarSale().then((x) => ({ name: 'kufar', items: x })),
@@ -544,7 +676,7 @@ async function main() {
     process.exit(1);
   }
 
-  const { out, rejects } = applyFilters(items);
+  const { out, rejects } = applyFilters(items, { origin });
 
   for (const it of out) {
     const { criteria, total } = scoreItem(it);
@@ -558,7 +690,7 @@ async function main() {
 
   const ranked = out.sort((a, b) => b.total - a.total || a.price - b.price);
 
-  const { dateStr, markdown } = buildReport({ items: out, ranked, bench, rejects, scanned });
+  const { dateStr, markdown } = buildReport({ items: out, ranked, bench, rejects, scanned, origin, nearLabel });
   const outDir = path.join(ROOT, 'reports');
   fs.mkdirSync(outDir, { recursive: true });
   const outPath = path.join(outDir, `garages-${CITY}-${dateStr}.md`);
@@ -567,7 +699,8 @@ async function main() {
   console.log(`Отчёт: ${outPath}`);
   console.log(`Просканировано: ${scanned.total} (Kufar ${scanned.kufar}, Realt ${scanned.realt}); прошло фильтры: ${out.length}`);
   ranked.slice(0, TOP).forEach((it, i) => {
-    console.log(`${i + 1}. ${it.total}/100 · ${money(it.price)} BYN · ${it.area} м² · ${it.address} · ~${it.rent} BYN/мес · ${it.url}`);
+    const near = it.nearMin != null ? ` · ${it.nearKm} км/~${it.nearMin} мин от старта` : '';
+    console.log(`${i + 1}. ${it.total}/100 · ${money(it.price)} BYN · ${it.area} м² · ${it.address}${near} · ~${it.rent} BYN/мес · ${it.url}`);
   });
 }
 
